@@ -34,17 +34,39 @@ _LANGUAGE_CHOICES = {
     "Turkish (tr)": "tr",
 }
 
-# Cache services by (model_size, compute_type) to avoid reloading the model
-_service_cache: dict[tuple[str, str], TranscriberService] = {}
+# Cache services by (model_size, device, compute_type) to avoid reloading the model
+_service_cache: dict[tuple[str, str, str], TranscriberService] = {}
 
 # Single app-level temp directory so output files persist until the process exits
 _tmp_dir = Path(tempfile.mkdtemp(prefix="transcriber_ui_"))
 
 
-def _get_service(model_size: str, compute_type: str) -> TranscriberService:
-    key = (model_size, compute_type)
+def _detect_device() -> str:
+    """Return 'cuda' if the CUDA 12 runtime DLLs are actually loadable, else 'cpu'."""
+    import ctypes, glob, sys, os
+    # Ensure pip-installed NVIDIA bin dirs are registered (safe to call multiple times)
+    for _dir in glob.glob(os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", "*", "bin")):
+        try:
+            os.add_dll_directory(_dir)
+        except Exception:
+            pass
+    for dll in ("cublas64_12.dll", "cudart64_12.dll"):
+        try:
+            ctypes.CDLL(dll)
+        except OSError:
+            return "cpu"
+    return "cuda"
+
+
+def _get_service(model_size: str, device: str, compute_type: str) -> TranscriberService:
+    if device == "auto":
+        device = _detect_device()
+    # float16 is GPU-only; fall back to int8 when running on CPU
+    if device == "cpu" and compute_type == "float16":
+        compute_type = "int8"
+    key = (model_size, device, compute_type)
     if key not in _service_cache:
-        config = TranscriberConfig(model_size=model_size, device="auto", compute_type=compute_type)
+        config = TranscriberConfig(model_size=model_size, device=device, compute_type=compute_type)
         _service_cache[key] = TranscriberService(config)
     return _service_cache[key]
 
@@ -57,6 +79,7 @@ def _transcribe(
     output_format: list[str],
     beam_size: int,
     vad_filter: bool,
+    device: str,
     compute_type: str,
 ) -> tuple[str, str, str | None, str | None, str | None]:
     """Run transcription and return (transcript, info, txt_path, srt_path, json_path)."""
@@ -67,7 +90,7 @@ def _transcribe(
     language_code = _LANGUAGE_CHOICES.get(language_label, "auto")
     language_option = None if language_code == "auto" else language_code
 
-    service = _get_service(model_size, compute_type)
+    service = _get_service(model_size, device, compute_type)
 
     audio_path = Path(audio_file)
     result = service.transcribe(
@@ -171,7 +194,13 @@ Powered by [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper).
                         choices=["int8", "float16", "float32"],
                         value="int8",
                         label="Compute type",
-                        info="int8 is fastest; float32 is most precise.",
+                        info="int8 is fastest; float32 is most precise. float16 requires a GPU.",
+                    )
+                    device = gr.Dropdown(
+                        choices=["auto", "cpu", "cuda"],
+                        value="auto",
+                        label="Device",
+                        info="'auto' picks CUDA if available, otherwise CPU.",
                     )
 
                 transcribe_btn = gr.Button("▶ Transcribe", variant="primary")
@@ -197,6 +226,7 @@ Powered by [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper).
             output_format,
             beam_size,
             vad_filter,
+            device,
             compute_type,
         ):
             transcript, info, txt, srt, json_ = _transcribe(
@@ -207,6 +237,7 @@ Powered by [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper).
                 output_format,
                 beam_size,
                 vad_filter,
+                device,
                 compute_type,
             )
             return (
@@ -227,6 +258,7 @@ Powered by [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper).
                 output_format,
                 beam_size,
                 vad_filter,
+                device,
                 compute_type,
             ],
             outputs=[transcript_box, status_md, txt_download, srt_download, json_download],
